@@ -23,6 +23,29 @@ codebase without asking any questions after the initial goal confirmation.
 This skill has a **single unified entrypoint**. On invocation, route based on
 (a) whether an active night shift exists and (b) the user's phrasing.
 
+> **This is the enforced (resident) fork.** The load-bearing gates are no longer
+> yours to run — they are enforced by root-owned Claude Code hooks you cannot see
+> or disable (see `ARCHITECTURE.md`). Practically:
+>
+> - **You do NOT run `codex review` yourself for code review.** When you
+>   `git commit`, a PreToolUse hook runs Codex on the staged diff, scope-checks
+>   the files, scans for secrets, and runs the project's fast checks. A blocked
+>   commit prints the reason on stderr — read it, fix it, re-stage, commit again.
+> - **Scope is enforced.** You may only write paths allowed by the root-owned
+>   `scope.yaml`; out-of-scope writes and commits are blocked. Don't fight it —
+>   if a task needs a path outside scope, mark it blocked and note it in the
+>   handoff for the operator.
+> - **Push is restricted** to `ns/*` branches (never `main`); `main` is protected
+>   server-side and advances only via CI-green promotion.
+> - Trying to bypass a gate (forging a review file, `git commit --no-verify`,
+>   chaining `git add && git commit`, editing hooks/CI/scope) will simply be
+>   denied. The gates fail **closed**: if Codex is unavailable, commits stop.
+>
+> The procedures below still describe *what good work looks like* and the planning
+> gates that have no automatic enforcement (KR approval, decomposition review,
+> end-of-shift consensus). Follow them — but know that the code-review, scope,
+> secret, and push rules are now walls, not honor-system requests.
+
 **A note on OKR vocabulary.** This skill borrows three terms from the OKR
 framework — **objective** (aspirational direction the user sets), **key
 result** (a concrete shippable step that advances the objective, gated by
@@ -76,18 +99,12 @@ uncommitted changes, objective, goal approval), send a single question,
 wait for the reply, then proceed to the next check. This keeps the pre-flight
 conversational and avoids overwhelming the user with a wall of decisions.
 
-### 1. Skill version check + auto-update
+### 1. Resolve the skill install directory
 
 Run this **first**, before any user prompt. It resolves the skill's install
-directory (used throughout pre-flight and by every later context refresh)
-and checks whether a newer version of the skill exists upstream. If so, it
-pulls it in. The check is fast (one `curl` to a GitHub raw URL) so it runs
-on every shift — no throttling.
-
-Updates apply to the **next** `/night-shift` invocation — Claude has already
-loaded the current SKILL.md into context, so hot-swapping the running shift
-is not possible. That is fine: the shift in progress completes on the loaded
-version, the next one picks up the update.
+directory (`SKILL_DIR`), used throughout pre-flight and by every later context
+refresh to locate `INVARIANTS.md`. This fork does **not** auto-update from any
+upstream (see the note in the block below).
 
 ```bash
 # Resolve SKILL_DIR. Plugin install first (authoritative), then user-level clone.
@@ -115,27 +132,11 @@ if [ -z "$SKILL_DIR" ] || [ ! -f "$SKILL_DIR/.claude-plugin/plugin.json" ]; then
   fi
 fi
 
-# Compare local vs upstream version (no jq required — sed parses the tiny
-# version field, so this works even before §3 installs jq).
-if [ -n "$SKILL_DIR" ]; then
-  LOCAL_PJ="$SKILL_DIR/.claude-plugin/plugin.json"
-  LOCAL_VER=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$LOCAL_PJ" | head -1)
-  REMOTE_VER=$(curl -fsS --max-time 5 \
-    "https://raw.githubusercontent.com/ppuliu/night-shift/main/.claude-plugin/plugin.json" \
-    2>/dev/null | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-
-  if [ -n "$LOCAL_VER" ] && [ -n "$REMOTE_VER" ] && [ "$LOCAL_VER" != "$REMOTE_VER" ] \
-     && [ "$(printf '%s\n%s\n' "$LOCAL_VER" "$REMOTE_VER" | sort -V | tail -1)" = "$REMOTE_VER" ]; then
-    if git -C "$SKILL_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-      git -C "$SKILL_DIR" pull --ff-only --quiet 2>/dev/null \
-        && echo "night-shift: updated $LOCAL_VER → $REMOTE_VER (git clone). Active on next /night-shift run."
-    else
-      TARGET="${PLUGIN_KEY:-night-shift}"
-      claude plugin update "$TARGET" >/dev/null 2>&1 \
-        && echo "night-shift: updated $LOCAL_VER → $REMOTE_VER (plugin). Active on next /night-shift run."
-    fi
-  fi
-fi
+# NOTE (resident fork): upstream auto-update is DELETED on purpose. The original
+# pulled from ppuliu/night-shift and would silently overwrite this fork back to
+# the stock version on the next shift. This fork is maintained in its own repo;
+# update it deliberately with git, never automatically. We still resolve
+# SKILL_DIR above because §9/§10 use it to locate INVARIANTS.md.
 ```
 
 `SKILL_DIR` is reused below: in §9 it is written to `state.json.skill_dir`,
@@ -230,16 +231,20 @@ collaborator consistency and clarity.
 
 ### 6. Branch check (git mode only)
 
-Run `git branch --show-current`. Must not be `main` or `master`.
+Run `git branch --show-current`. The agent works on an **`ns/*` branch**, never
+directly on `main`/`master` (which is protected server-side and advances only via
+CI-green promotion — see `promote/branch-protection.md`).
 
-- If on `main` or `master`: **propose creating a new branch** rather than
-waiting for the user. Suggest a descriptive name based on session context
-(e.g., `night-shift/YYYY-MM-DD` or `feat/<topic>` inferred from the
-conversation). Ask for confirmation or a different name. On confirmation,
-run `git checkout -b <name>` and proceed.
-- On any other branch: proceed on it.
+- If on `main` or `master`: create/switch to an `ns/*` branch — default
+  `ns/staging`, or `ns/<topic>` inferred from context — with
+  `git checkout -b ns/staging`, then proceed.
+- If already on an `ns/*` branch: proceed on it.
+- If on some other branch: proceed, but note that only `ns/*` pushes are allowed
+  by the gate; rename to `ns/*` if you intend to push.
 
-Record the branch as `BRANCH` and the current commit as `BASE_COMMIT`.
+Record the branch as `BRANCH` and the current commit as `BASE_COMMIT`. Whether
+pushing happens at all is controlled by `push.enabled` in `scope.yaml` (default
+off until branch protection is configured).
 
 ### 7. Clean working tree (git mode only)
 
@@ -267,7 +272,7 @@ append `Z`.
 ```bash
 RUN_ID=$(date +%Y-%m-%d-%H%M)                              # local time
 RUN_DIR=".night-shift/runs/${RUN_ID}"
-mkdir -p "$RUN_DIR/key results"
+mkdir -p "$RUN_DIR/key-results"
 ```
 
 Write initial state to `$RUN_DIR/state.json`. Note `started_at` is **null** at
@@ -427,7 +432,6 @@ want. Use emojis and dividers so it stands out from ordinary output:
   Handoff:     .night-shift/runs/RUN_ID/handoff.md
 
   Say "end night shift" any time to stop early.
-  Type /remote-control to monitor from your phone or browser.
 
   Sleep well. 🌙
 ═══════════════════════════════════════════════════════════════
@@ -589,7 +593,7 @@ dance happens.
 │                   OUTER LOOP — per KEY RESULT                       │
 │                                                                   │
 │  0. Check end conditions (§End Conditions). If met → Handoff.     │
-│  A. Propose next key result → write $RUN_DIR/proposed-key result.md   │
+│  A. Propose next key result → write $RUN_DIR/proposed-key-result.md   │
 │  B. Codex key result approval review (gate)                         │
 │        Approved → continue. Rejected → record, go back to A.      │
 │  C. Write decomposition plan → $RUN_DIR/current-decomp.md         │
@@ -623,7 +627,7 @@ Conditions). If either fires, skip to Handoff. Otherwise continue to A.
 
 ### Outer A: Propose the Next Key Result
 
-Write a proposal to `$RUN_DIR/proposed-key result.md`. Overwritten per
+Write a proposal to `$RUN_DIR/proposed-key-result.md`. Overwritten per
 iteration. Include:
 
 - Proposed key result title
@@ -745,7 +749,7 @@ were blocked — the key result is "as done as it will get").
 - Update `state.average_task_duration_minutes` = running mean over all
 completed tasks across all key results. This informs future
 decomposition and end-condition estimates.
-- `rm "$RUN_DIR/current-decomp.md"` and `rm "$RUN_DIR/proposed-key result.md"`.
+- `rm "$RUN_DIR/current-decomp.md"` and `rm "$RUN_DIR/proposed-key-result.md"`.
 - **Full skill refresh.** Re-read the entire skill spec from disk
   before proposing the next key result. Inner 0's per-task refresh
   only re-reads `INVARIANTS.md` (the 12 non-negotiables); the long
@@ -836,68 +840,53 @@ task's work.
 
   **Do NOT delegate Inner 0, 1, 3, 4, 5, or 6.**
 
-### Inner 3: Code Review Loop (Codex) — with file gate
+### Inner 3: Code Review (Codex) — enforced by the commit gate
 
-**Run the drift check** before the first review round.
+**In this fork you do NOT run `codex review` yourself.** The commit gate does it
+for you: when you `git commit` in Inner 5, a root-owned PreToolUse hook runs
+`codex review` on the staged diff at high effort, and blocks the commit if Codex
+reports any `[P1]`/`[P2]` finding. This is not forgeable — the gate runs Codex
+itself and never reads a review file you wrote.
 
-You MUST run the actual `codex review` CLI. Checking output yourself and
-deciding "it's fine" is NOT the same as Codex saying it's clean.
+So the review "loop" is simply your fix loop against the gate:
 
 ```
-REVIEW_ROUND      = 0
-CODEX_OUTPUT_FILE = "$RUN_DIR/key-results/<G>/tasks/<S>/code-review.txt"
-BASE_SHA          = <the task's start_commit from state.json>
-
-while REVIEW_ROUND < 10:
-    REVIEW_ROUND += 1
-    # Invoke via the Bash tool with timeout: 600000 (10 min):
-    codex review --base $BASE_SHA -c 'model_reasoning_effort="high"' 2>&1 \
-      | tee $CODEX_OUTPUT_FILE
-    # The pre-commit gate will verify CODEX_OUTPUT_FILE exists and contains a verdict.
-
-    Parse the output:
-    - NO P1 or P2 findings:
-        → code_review_status = "clean"
-        → code_review_rounds = REVIEW_ROUND
-        → code_review_file = CODEX_OUTPUT_FILE
-        → code_review_evidence = <the verdict line, e.g. "No P1 or P2 findings">
-        → BREAK
-    - P1 or P2 findings:
-        → Fix each finding
-        → Update state with round + findings
-        → CONTINUE (re-run review on the fixes, overwriting CODEX_OUTPUT_FILE)
-
-If REVIEW_ROUND == 10 and still P1/P2:
-    → HARD STOP: revert task via scoped rollback, mark blocked
+1. Implement the task (Inner 2), then stage exactly its files (Inner 5).
+2. git commit.
+3. If the gate BLOCKS with Codex findings on stderr:
+     - fix each finding
+     - re-stage
+     - git commit again  (the gate re-runs Codex on the new diff)
+4. Repeat until the commit is allowed.
 ```
 
-**Every fix MUST be re-reviewed.** The loop only exits when Codex reports no
-significant issues, or after 10 failed rounds (triggers revert). No "findings
-don't apply" escape — fix them or revert.
+Rules that still apply:
 
-**"Clean"** = no `[P1]` or `[P2]` markers in the Codex output.
+- **Every fix is re-reviewed automatically** — each commit attempt is a fresh
+  Codex pass. There is no "findings don't apply" escape; fix them or the commit
+  stays blocked.
+- **Do not try to shortcut the gate.** `git commit --no-verify`, chaining
+  `git add … && git commit`, or hand-writing a `code-review.txt` all fail — the
+  gate ignores review files and denies auto-staging/chained commits.
+- **If you cannot get a clean review after ~10 rounds on the same change**, the
+  gate escalates and tells you to stop: revert the task (scoped rollback), mark
+  it `blocked` in state.json with the outstanding findings, and move on.
+- **If the gate reports Codex is unavailable** (crash/timeout), commits are
+  blocked fail-closed — you cannot proceed by self-reviewing. Flag it in the
+  handoff; the operator is alerted.
 
-**Audit-trail option:** intermediate rounds MAY be saved as
-`review-round-N.txt` alongside `code-review.txt` so the per-round Codex
-output is preserved across revisions. This is encouraged for tasks that
-take more than ~3 rounds — without it, the iteration history is lost
-and post-mortem debugging is impossible. `code-review.txt` MUST always
-be the FINAL verdict file (overwritten each round, last write wins) —
-it is what the Inner 5 structural gate checks. The `review-round-N.txt`
-files are audit-only and not gated.
-
-**Does NOT count as running Inner 3:**
-
-- "Too simple to need review"
-- "Tests pass so it's fine"
-- Running the review on a different task
-- Writing a plausible-looking review to the file without actually running Codex
+You may still keep notes on findings in the run folder for your own tracking, but
+no file you write is consulted by the gate.
 
 ### Inner 4: Validate
 
 Before marking the task complete:
 
-1. Run the full test suite — all tests must pass.
+1. Run the task's relevant tests — they must pass. The commit gate runs the
+   project's **fast checks** (lint/typecheck from `scope.yaml`) and the **full
+   suite runs in staging CI**, which gates promotion to `main`; but you should
+   still run tests locally as you work so you don't discover failures only at
+   push time.
 2. Verify the task's deliverables are actually delivered.
 3. **For UI tasks** (templates, pages, CSS, frontend components):
 
@@ -908,84 +897,63 @@ Before marking the task complete:
 
 **Validation failure is a hard stop.** If tests fail:
 
-- Attempt to fix (1 attempt)
-- Re-run `codex review --base $BASE_SHA -c 'model_reasoning_effort="high"' 2>&1 | tee $CODEX_OUTPUT_FILE`
-on the fixes
-- Re-run tests
+- Attempt to fix (1 attempt), then re-run the tests. (You do not re-run Codex —
+  committing re-triggers the gate's review automatically.)
 - If tests still fail:
   - **Git mode:** scoped rollback of this task, mark `blocked`, record
   failures in `issues_noted`, move to next task.
   - **Degrade mode:** mark task `blocked`, record failures. Partial
   changes remain in the working tree — flag in handoff.
 
-**Principle: never commit code that doesn't pass tests.** The human wakes up
-to a branch where every commit is green, even if fewer tasks completed.
+**Principle: never commit code that doesn't pass tests.** Every commit that
+reaches `main` has passed the full suite in CI, so the human wakes up to a green
+`main` — even if fewer tasks completed.
 
 ### Inner 5: Commit (git mode) / Record (degrade mode)
 
 **Git mode — Run the drift check first.**
 
-**Pre-commit structural gate.** Before staging anything, verify ALL of:
+**The commit gate does the enforcing now.** There is no longer an agent-run
+structural file check (it was forgeable — the same agent wrote the file it
+checked). When you `git commit`, a root-owned PreToolUse hook enforces, in order:
 
-1. `state.key_results[G].tasks[S].code_review_status` is either `"clean"`
-   OR `"self-reviewed-unavailable"` (no other value passes the gate)
-2. `state.key_results[G].tasks[S].code_review_file` is set AND the file
-   exists AND is non-empty
-3. The file contains a Codex verdict line (the `code_review_evidence` stored
-   in state matches a line in the file)
-4. **If `code_review_status == "self-reviewed-unavailable"`,** the file
-   MUST also contain the literal header line beginning with
-   `CODEX UNAVAILABLE — SELF-REVIEW`. This is what distinguishes an honest
-   Codex-down self-review from a fabricated `code-review.txt` written to
-   bypass the gate.
-5. `state.key_results[G].tasks[S].pre_files_recorded == true` AND the file
-   `pre-files.txt` exists in the task folder. Without it, scoped rollback
-   cannot run cleanly if a later task needs to revert this one.
+1. **clean-except-staged** — the whole working tree must be staged (so the review
+   target equals the commit target). This is why you must stage before you
+   commit, in a **separate** step — `git add … && git commit` in one command is
+   denied.
+2. **scope** — every staged path must be in `scope.yaml` (deny wins).
+3. **secrets** — gitleaks scans the staged diff.
+4. **fast checks** — the project's lint/typecheck.
+5. **Codex review** — high-effort, on the staged diff; any `[P1]`/`[P2]` blocks.
 
-```bash
-REVIEW_FILE="$RUN_DIR/key-results/<G>/tasks/<S>/code-review.txt"
-PRE_FILES="$RUN_DIR/key-results/<G>/tasks/<S>/pre-files.txt"
+If any step fails, the commit is denied and the reason is on stderr. Fix and
+commit again. You do not need to run or record any of these yourself.
 
-[ -s "$REVIEW_FILE" ] || { echo "FATAL: code-review.txt missing or empty"; exit 1; }
-[ -s "$PRE_FILES" ]  || { echo "FATAL: pre-files.txt missing — Inner 2 was skipped"; exit 1; }
-grep -qF "$CODE_REVIEW_EVIDENCE" "$REVIEW_FILE" || { echo "FATAL: verdict line not in file"; exit 1; }
-
-if [ "$CODE_REVIEW_STATUS" = "self-reviewed-unavailable" ]; then
-  grep -qE '^CODEX UNAVAILABLE — SELF-REVIEW' "$REVIEW_FILE" \
-    || { echo "FATAL: self-review claimed but header missing"; exit 1; }
-fi
-```
-
-If any of this fails, the task CANNOT be committed — revert it. Hard
-gate. No exceptions. This exists specifically to prevent the agent from
-rationalizing "I'll skip Codex for efficiency" after a context compaction:
-the file either exists with real Codex output (or a properly-headered
-self-review with `pre-files.txt` recorded), or the task dies here.
-
-Stage only this task's deliverables with targeted `git add`:
+Stage only this task's deliverables with targeted `git add` (in its own step):
 
 ```bash
 git add src/errors/ApiError.ts tests/errors/ApiError.test.ts
-# NEVER: git add . or git add -A
+# NEVER: git add . or git add -A   — stage exactly this task's files
 ```
 
-Commit:
+Then commit (a separate Bash call), using a conventional-commit message:
 
 ```
-[[ORCA_RAW_HTML_INLINE:%3Ctype%3E]]: [task title]
+<type>: <task title>
 
-Night shift key result [[ORCA_RAW_HTML_INLINE:%3CG%3E]] ("[[ORCA_RAW_HTML_INLINE:%3Ckey%20result%20title%3E]]"), task [[ORCA_RAW_HTML_INLINE:%3CS%3E]]/[[ORCA_RAW_HTML_INLINE:%3Ctotal%3E]]:
-- [key change 1]
-- [key change 2]
+Night shift key result <G> ("<key result title>"), task <S>/<total>:
+- <key change 1>
+- <key change 2>
 ```
+
+(`<type>` is fix/feat/refactor/test/docs/chore as appropriate.)
 
 Update state.json:
 
 - Task `status` → `completed`
-- Record commit hash
+- Record commit hash (the commit succeeded, so the gate's review passed)
 - **Update `expected_head`** to new HEAD: `git rev-parse HEAD`
-- Confirm `code_review_rounds`, `code_review_status`, `code_review_evidence`,
-`code_review_file` are recorded
+- Record `code_review_rounds` = how many commit attempts it took to pass the gate
 - Update test results
 
 **Degrade mode:** no commit. Update state.json same way but with
@@ -1247,20 +1215,20 @@ review is valuable but not the primary quality gate. Write a short note to
 the corresponding adversarial file (e.g. `decomp-adversarial.txt`) containing
 `"UNAVAILABLE: <error message>"` so the artifact still exists. Record the
 skip in state.json.
-- **Code review (Inner 3):** Primary quality gate. If unavailable:
-  - Perform a self-review: re-read all changed files with fresh eyes.
-  - Run the test suite as the minimum quality bar.
-  - Write the self-review output to the task's `code-review.txt` with
-  a clearly-marked header: `"CODEX UNAVAILABLE — SELF-REVIEW: <error>"`
-  followed by your notes.
-  - Record `code_review_status: "self-reviewed-unavailable"` in state.json
-  (a distinct value from `"clean"`).
-  - The pre-commit structural gate still requires the file to exist and
-  be non-empty — the self-review artifact satisfies that.
-  - The handoff MUST prominently flag that these tasks were not Codex-reviewed.
+- **Code review (Inner 3):** There is **no self-review fallback** in this fork.
+  The commit gate runs Codex itself and **fails closed** — if Codex is down,
+  your `git commit` is blocked and stays blocked. You cannot self-review your way
+  to a commit. When this happens:
+  - Do NOT keep retrying in a tight loop (each attempt re-invokes Codex and burns
+    quota / hits the same outage).
+  - Leave the task's changes staged but uncommitted, record the outage in
+    `issues_noted`, and either wait for Codex to recover or move to a
+    non-code task. The operator is alerted automatically (ntfy).
+  - The handoff MUST prominently flag any work left uncommitted due to a Codex
+    outage.
 
-No other reason justifies skipping Codex — not "straightforward changes", not
-"UI-only work", not "tests pass". Run it.
+No reason justifies trying to bypass the review gate — not "straightforward
+changes", not "UI-only work", not "tests pass". The gate will deny it anyway.
 
 ## Handoff (End of Successful Shift)
 
@@ -1512,8 +1480,9 @@ exists. Also the Stop path from §Stop/Resume/Abandon.
 4. Write the handoff note with current progress, clearly marking any
    interrupted task as "interrupted — reverted" or "interrupted —
    partial changes in tree".
-5. Run the standard Handoff procedure (commit handoff in git mode, leave
-   file at cwd root in degrade mode).
+5. Run the standard Handoff procedure. Do NOT commit the handoff —
+   `.night-shift/` is gitignored and out of scope; the handoff is private notes,
+   not a repo artifact.
 6. Set run `status: "interrupted"` (not `completed`) and `ended_at` in
    state.json.
 7. Print terminal summary as in Handoff.
@@ -1560,7 +1529,11 @@ the user must review and clean them up manually.
    hours; the disk is the source of truth.
 6. **Stay in your lane.** Only work within approved goals. Task expansion
    must stay in the goal's subject matter; autonomous additions must be flagged.
-7. **Never push.** Never push to remote. The human decides when to push.
+7. **Push only `ns/*`, never `main`.** When `push.enabled` is on, push at task
+   boundaries to `ns/*` staging branches only; `main` is protected server-side
+   and advances only when CI is green (promote workflow). Never force-push. The
+   gate denies pushes to `main` and force pushes. When `push.enabled` is off,
+   don't push — the operator does.
 8. **State file is truth.** Always update and re-read state.json. Don't trust
    your memory for multi-hour runs.
 9. **Runs are independent.** Each shift gets its own folder under

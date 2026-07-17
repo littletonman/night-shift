@@ -1,0 +1,44 @@
+{
+  "_comment": "night-shift enforcement hooks. Installed by install.sh to /etc/claude-code/managed-settings.json (root-owned, 644). allowManagedHooksOnly makes these the ONLY hooks Claude Code loads: user/project/local settings hooks are ignored, so the agent cannot register competing hooks or disable these via a lower-precedence settings file. Hook commands point at the root-owned /opt/night-shift copy. timeout is seconds (set to 900; the platform clamps to its own max).",
+  "allowManagedHooksOnly": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "/opt/night-shift/enforcement/hooks/gate-bash.sh", "timeout": 900 }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "/opt/night-shift/enforcement/hooks/gate-write.sh", "timeout": 60 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "/opt/night-shift/enforcement/hooks/gate-stop.sh", "timeout": 30 }
+        ]
+      }
+    ],
+    "ConfigChange": [
+      {
+        "matcher": "user_settings|project_settings|local_settings",
+        "hooks": [
+          { "type": "command", "command": "/opt/night-shift/enforcement/hooks/gate-config.sh", "timeout": 20 }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          { "type": "command", "command": "/opt/night-shift/enforcement/hooks/session-start.sh", "timeout": 20 }
+        ]
+      }
+    ]
+  }
+}

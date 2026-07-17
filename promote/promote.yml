@@ -1,0 +1,179 @@
+# =============================================================================
+# promote.yml — night-shift L1 (server-side) promotion gate
+#
+# The "staging -> promote" model (Mode B):
+#   * The autonomous agent can only push ns/* branches. A repository ruleset
+#     on `main` blocks every actor except the promote identity used here
+#     (setup: promote/branch-protection.md).
+#   * This workflow watches the CI workflow on ns/staging. When a CI run
+#     completes SUCCESSFULLY, this workflow fast-forwards `main` to the EXACT
+#     commit that CI tested. main therefore only ever advances to an
+#     already-green commit — "main is red" is structurally impossible,
+#     regardless of anything the agent does locally.
+#
+# INSTALL: copy this file to .github/workflows/promote.yml ON THE DEFAULT
+# BRANCH (main). workflow_run events "will only trigger a workflow run if the
+# workflow file exists on the default branch" — committing it only to
+# ns/staging does nothing until it lands on main once.
+#   https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run
+# =============================================================================
+
+name: Promote
+
+# Makes runs in the Actions list self-describing: which SHA is being promoted.
+run-name: "Promote ns/staging (${{ github.event.workflow_run.head_sha }}) to main"
+
+on:
+  workflow_run:
+    # >>> OPERATOR ACTION REQUIRED <<<
+    # Replace <<CI_WORKFLOW_NAME>> with the top-level `name:` value INSIDE
+    # your .github/workflows/ci.yml — NOT the filename. E.g. if ci.yml begins
+    # with `name: CI`, write:  workflows: ["CI"]
+    # (workflow_run matches on the workflow's name.)
+    #
+    # NOTE: workflow_run cannot AND multiple workflows together — it fires
+    # once per completed run of ANY listed workflow. Keep exactly ONE CI
+    # workflow (or one aggregator workflow that needs everything else) as
+    # the gate here.
+    workflows: ["<<CI_WORKFLOW_NAME>>"]
+    # Fire only when a run finishes, so its conclusion is available below.
+    types: [completed]
+    # Only CI runs whose HEAD BRANCH is ns/staging. (Re-checked in the
+    # job-level `if:` below — defense in depth.)
+    branches: [ns/staging]
+
+# Least privilege for the automatic GITHUB_TOKEN of this run: the actual push
+# to main uses PROMOTE_TOKEN (below), so GITHUB_TOKEN only needs to read.
+permissions:
+  contents: read
+
+# Serialize promotions so two runs can never race each other's fetch/push.
+# cancel-in-progress:false — a newly queued promotion WAITS for the in-flight
+# one (GitHub keeps only the newest queued run per group). Each run
+# re-validates fast-forward-ness against a fresh `origin/main` anyway, so a
+# stale queued run no-ops or fails safe; it cannot clobber main.
+concurrency:
+  group: promote-to-main
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Fast-forward main to CI-green commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # PROMOTE_TOKEN should live in the "promote" ENVIRONMENT, whose deployment
+    # branch policy allows only `main` (branch-protection.md §5). workflow_run
+    # jobs execute against the default branch, so this job qualifies — but a
+    # CI run on an agent-pushed ns/* branch does NOT, which stops an
+    # agent-authored workflow from ever reading the secret.
+    # If you stored PROMOTE_TOKEN as a plain repository secret instead, this
+    # line is harmless (GitHub auto-creates an unprotected environment and
+    # repo secrets still resolve) — but the environment route is safer.
+    environment: promote
+
+    # Guards (all three required):
+    #  * conclusion == 'success'  — `types: [completed]` also fires for
+    #    failed/cancelled runs; only green runs may promote.
+    #  * head_branch == 'ns/staging' — belt-and-braces with the trigger filter.
+    #  * head_repository == this repo — never promote a commit that CI built
+    #    from a FORK branch that happens to be named ns/staging. Workflows
+    #    triggered by workflow_run get secrets and write-capable tokens even
+    #    when the triggering run had none, so treat the trigger as untrusted:
+    #    https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'ns/staging' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+
+    steps:
+      # -----------------------------------------------------------------
+      # Check out the EXACT commit CI tested: workflow_run.head_sha.
+      # Never check out a branch name here, for two reasons:
+      #   1. For workflow_run events the default checkout is the DEFAULT
+      #      branch (GITHUB_SHA = "last commit on default branch") — not
+      #      what CI tested at all.
+      #   2. ns/staging may have received NEWER commits since CI started.
+      #      Checking out the branch tip would promote commits CI never
+      #      saw. Pinning head_sha promotes precisely the tested tree.
+      # -----------------------------------------------------------------
+      - name: Check out the CI-tested commit (pinned SHA)
+        uses: actions/checkout@v4 # newer majors of actions/checkout are fine too
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          # Full history: the ancestry checks below need real merge-bases,
+          # and it also fetches origin/main into the local clone.
+          fetch-depth: 0
+          # Authenticate as the promote identity. actions/checkout persists
+          # this credential into the local git config by default
+          # (persist-credentials: true), so the plain `git push origin ...`
+          # below runs as the promote bot — the only actor the ruleset on
+          # main allows to update it.
+          token: ${{ secrets.PROMOTE_TOKEN }}
+
+      - name: Fast-forward main to the tested commit
+        env:
+          # Event data is passed through env vars (not templated inline into
+          # the script) so payload contents can never inject into the shell.
+          PROMOTE_SHA: ${{ github.event.workflow_run.head_sha }}
+          CI_RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          # Paranoia: confirm checkout really gave us the tested commit.
+          test "$(git rev-parse HEAD)" = "$PROMOTE_SHA"
+
+          # Fresh view of main immediately before acting.
+          git fetch origin main
+
+          echo "CI-green commit : $PROMOTE_SHA"
+          echo "CI run          : $CI_RUN_URL"
+          echo "main is at      : $(git rev-parse origin/main)"
+
+          # ---- Case 1: main already contains this commit. -----------------
+          # Either this exact commit was already promoted, or a NEWER green
+          # commit was promoted first and this event arrived late/out of
+          # order. Nothing to do — succeed quietly rather than turning a
+          # benign duplicate into a red run (alarm fatigue is a failure mode
+          # too). Genuine problems are caught by Case 2 and by the push.
+          if git merge-base --is-ancestor "$PROMOTE_SHA" origin/main; then
+            echo "main already contains $PROMOTE_SHA — nothing to promote."
+            echo "Promote: main already contained \`$PROMOTE_SHA\` (no-op)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # ---- Case 2: histories diverged — fast-forward impossible. ------
+          # A NON-FAST-FORWARD here means someone or something advanced or
+          # rewrote main OUT OF BAND (outside this workflow). Under the
+          # ruleset in branch-protection.md that should be impossible, so
+          # treat it as an incident, not a merge problem:
+          #   * Who pushed to main?  (git log origin/main / repo activity)
+          #   * Is the ruleset still Active, targeting main, with ONLY the
+          #     promote identity on its bypass list?
+          #   * Did a human use their admin bypass "just this once"?
+          # NEVER force-push main to "fix" this. Reconcile by rebuilding
+          # ns/staging on top of the new main and letting CI+promote run.
+          if ! git merge-base --is-ancestor origin/main "$PROMOTE_SHA"; then
+            echo "::error::main has diverged from the CI-tested commit — refusing to promote. main was advanced out of band; investigate before re-running (see comments in promote.yml)."
+            echo "Promote FAILED: non-fast-forward. main moved out of band; investigate." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # ---- Case 3: clean fast-forward — push it. ----------------------
+          # A plain (non-force) `git push` is fast-forward-only AT THE
+          # SERVER: if main moves between our fetch and this push, GitHub
+          # atomically rejects the update (compare-and-swap on the ref) and
+          # this job goes red instead of clobbering anything. The checks
+          # above exist to give a precise diagnosis — the server is the
+          # actual safety mechanism.
+          git push origin "$PROMOTE_SHA:refs/heads/main"
+
+          echo "Promoted: main -> $PROMOTE_SHA (fast-forward)."
+          echo "Promote: main fast-forwarded to \`$PROMOTE_SHA\` ([CI run]($CI_RUN_URL))." >> "$GITHUB_STEP_SUMMARY"
+
+          # Aftermath note: because this push uses a PAT (not GITHUB_TOKEN),
+          # push-triggered workflows DO run on main afterwards. That cannot
+          # loop back into this workflow (we only react to CI runs whose
+          # head branch is ns/staging), but your CI may re-test the same SHA
+          # on main — harmless duplication; exclude main in ci.yml's
+          # `on.push.branches` if you want to save the minutes.

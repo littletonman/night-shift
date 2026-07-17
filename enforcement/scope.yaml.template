@@ -1,0 +1,88 @@
+# scope.yaml — the machine-readable scope contract for a night-shift project.
+#
+# This file is ROOT-OWNED. The agent cannot edit it (no sudo) and cannot delete
+# it (its .night-shift/ directory carries the sticky bit). Only the operator
+# changes scope, with `sudo`. It is the single source of truth for:
+#   - which paths the agent may touch          (allow_paths / deny_paths)
+#   - which commands are forbidden             (deny_commands)
+#   - what the commit gate runs                (gate.*)
+#   - where the agent may push                 (push.*)
+#   - where alerts go                          (notify.*)
+#
+# Copy this template to <repo>/.night-shift/scope.yaml and tailor it to the
+# project. Paths are gitignore-flavored globs (see enforcement/lib/scope_match.py):
+#   *   any run of chars except '/'      **  any number of path segments
+#   ?   one char except '/'              trailing '/'  == '/**'
+#   a pattern with no '/' matches its basename at ANY depth;
+#   a pattern with a '/' is anchored at the repo root.
+
+# --- scope: what the agent may write ---------------------------------------
+# A staged file must match >=1 allow_paths glob AND no deny_paths glob. Deny
+# always wins. A file matching nothing in allow_paths is OUT of scope.
+# Prefer rooted patterns here (with '/'). Empty allow_paths denies everything.
+allow_paths:
+  - "src/**"
+  - "tests/**"
+  - "docs/**"
+
+# deny_paths ALWAYS lose the file (even if allow_paths would match). Keep CI,
+# enforcement, secrets, infra, and DB migrations here. Editing .github/workflows
+# would let the agent turn red CI green — never allow it.
+deny_paths:
+  - ".github/workflows/**"     # CI definitions — the L1 guarantee lives here
+  - ".claude/**"               # agent settings
+  - ".night-shift/**"          # run state + this contract
+  - "hooks/**"                 # any in-repo hook scripts
+  - "scope.yaml"               # this file, at any depth
+  - "**/.env*"                 # secrets (defense-in-depth; also secret-scanned)
+  - "infra/**"                 # infrastructure-as-code
+  - "**/migrations/**"         # DB migrations (migration_policy: deny)
+  - "**/*.tf"                  # terraform
+
+# --- deny_commands: forbidden shell commands --------------------------------
+# Each entry is matched as a contiguous token sequence within any command in the
+# Bash tool. (`git push --force`, force refspecs, and history plumbing are also
+# denied unconditionally, regardless of this list.)
+deny_commands:
+  - "rm -rf"
+  - "docker"
+  - "supabase db push"
+  - "prisma migrate deploy"
+  - "prisma migrate dev"
+  - "drizzle-kit push"
+  - "flyway migrate"
+  - "alembic upgrade"
+
+# --- policies ---------------------------------------------------------------
+migration_policy: deny        # schema/RLS changes never run unattended
+dependency_policy: propose-only  # new packages are proposed in the handoff, not installed
+
+# --- gate: what the commit gate runs ---------------------------------------
+gate:
+  # Cheap checks first; a failure here blocks BEFORE spending Codex quota.
+  # Use the project's real commands. Examples:
+  #   - "npm run lint"        - "pnpm -w typecheck"       - "make lint"
+  #   - "ruff check ."        - "mypy src"                - "cargo clippy -- -D warnings"
+  fast_checks:
+    - "true"                  # <-- replace with the project's lint/typecheck
+
+  # Optional heavier checks in the gate. USUALLY EMPTY: the full test suite runs
+  # in staging CI (which gates promotion to main). Enabling tests here risks the
+  # hook timeout on large suites.
+  full_checks: []
+
+  codex_effort: high          # high everywhere to start; tune down with data
+  codex_timeout_sec: 540      # fail-closed if Codex exceeds this (hook cap ~600s)
+  max_review_rounds: 10       # after N consecutive P1/P2 rounds: revert + block
+  require_secret_scan: true   # gitleaks on the staged diff; block on any hit
+  gitleaks_cmd: "protect --staged --redact --no-banner"
+
+# --- push: where the agent may push (L2 backup to GitHub branch protection) --
+push:
+  enabled: false              # set true once the staging/promote path is live
+  allow_refs:                 # a push target must start with one of these
+    - "ns/"
+
+# --- notify: where alerts go (ntfy.sh push) --------------------------------
+notify:
+  ntfy_topic: ""              # e.g. "night-shift-<random-suffix>"; empty disables
