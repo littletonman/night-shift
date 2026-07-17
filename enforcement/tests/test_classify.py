@@ -170,6 +170,16 @@ expect('sh -s', "DENY")                                   # -s reads stdin, no f
 expect('bash build.sh', "PASS")                           # running a script file (documented limitation)
 expect('bash -c "echo ok"', "PASS")                       # inline -c still analyzed/recursed
 
+# heredoc BODIES are stripped before tokenizing — apostrophes no longer fail-close
+expect("cat > f.txt <<EOF\nit's a test, don't crash\nEOF", "PASS")
+expect("cat > .night-shift/runs/r/state.json <<JSON\nit's fine\nJSON", "PASS")  # the exact case the agent hit
+expect('cat > f <<-EOF\n\tindented body\n\tEOF', "PASS")   # <<- dash heredoc, indented close
+expect("bash <<EOF\ngit commit -m x\nEOF", "DENY")        # shell fed by heredoc still denied
+expect("sh <<'EOF'\necho hi\nEOF", "DENY")                # quoted-delim shell heredoc still denied
+expect('echo "a << b"', "PASS")                           # << inside quotes is NOT a heredoc
+expect('git commit -m "use << for heredocs"', "COMMIT")   # << in a commit message, not a heredoc
+expect("git commit -m \"don't crash\"", "COMMIT")         # apostrophe in a double-quoted message
+
 # git aliases (a name-based evasion) cannot be defined
 expect('git config alias.ci commit', "DENY")
 expect('git config --global alias.ci commit', "DENY")

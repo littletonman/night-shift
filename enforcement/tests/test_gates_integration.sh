@@ -10,6 +10,13 @@ PASS=0; FAIL=0
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# Force resolve.py's no-registry (dev/test) mode: point NS_REGISTRY at a path
+# that does not exist, so enforcement resolves from each temp repo's own
+# scope.yaml instead of the real root-owned /opt registry. Without this, an
+# installed /opt/night-shift/onboarded.list makes every unregistered temp repo
+# resolve to "none" (passthrough) and every block assertion fails.
+NS_TEST_REGISTRY="$WORK/no-such-registry.list"; export NS_REGISTRY="$NS_TEST_REGISTRY"
+
 # --- fake codex: emits a canned transcript based on NS_FAKE_CODEX_MODE ------
 FAKEBIN="$WORK/bin"; mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/codex" <<'FAKE'
@@ -17,6 +24,12 @@ cat > "$FAKEBIN/codex" <<'FAKE'
 mode="${NS_FAKE_CODEX_MODE:-clean}"
 case "$mode" in
   crash) echo "boom" >&2; exit 3 ;;
+  capacity)
+    printf 'OpenAI Codex v0.142.2\n--------\nmodel: gpt-5.5\n--------\nuser\ncurrent changes\nERROR: Selected model is at capacity. Please try a different model.\n'; exit 1 ;;
+  capacity_then_clean)
+    cf="${NS_FAKE_COUNTER:-/tmp/ns-fake-counter}"; c=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$cf"
+    if [ "$c" -lt 3 ]; then printf 'OpenAI Codex v0.142.2\nERROR: Selected model is at capacity.\n'; exit 1
+    else printf 'OpenAI Codex v0.142.2\n--------\nmodel: gpt-5.5\n--------\nuser\ncurrent changes\nexec\n succeeded\ncodex\nNo correctness issues were identified.\n'; exit 0; fi ;;
   clean)
     printf 'OpenAI Codex v0.142.2\n--------\nmodel: gpt-5.5\n--------\nuser\ncurrent changes\nexec\n/bin/bash -lc x\n succeeded\ncodex\nNo correctness issues were identified.\n' ;;
   dirty)
@@ -168,7 +181,7 @@ expect_rc "registry: benign cmd allowed again after restore" 0 "$(run_bash_gate 
 mv "$R12/.night-shift" "$R12/.off"
 expect_rc "registry: interactive session passes through when scope missing" 0 "$(run_bash_gate "$R12" 'ls -la' default)"
 mv "$R12/.off" "$R12/.night-shift"
-unset NS_REGISTRY
+export NS_REGISTRY="$NS_TEST_REGISTRY"
 
 # === CWD-ESCAPE (operate on a registered repo from an outside cwd) ==========
 RREG2="$WORK/reg2.list"
@@ -180,7 +193,7 @@ expect_rc "cwd-escape: git -C <repo> push main blocked from outside cwd" 2 "$(ru
 expect_rc "cwd-escape: cd <repo> && commit blocked from outside cwd" 2 "$(run_bash_gate "$PARENT" "cd $R13 && git commit -m x")"
 expect_rc "cwd-escape: write into repo deny-path from outside cwd blocked" 2 "$(run_write_gate "$PARENT" "$R13/.github/workflows/ci.yml")"
 expect_rc "cwd-escape: unrelated command from outside cwd passes through" 0 "$(run_bash_gate "$PARENT" 'ls -la')"
-unset NS_REGISTRY
+export NS_REGISTRY="$NS_TEST_REGISTRY"
 
 # === EMPTY/UNUSABLE scope.yaml -> fail closed ==============================
 R15="$(mkrepo)"; : > "$R15/.night-shift/scope.yaml"       # present but empty
@@ -188,7 +201,7 @@ RREG3="$WORK/reg3.list"; ( cd "$R15" && pwd -P ) > "$RREG3"
 export NS_REGISTRY="$RREG3"
 expect_rc "empty scope.yaml: benign cmd blocked (classifier fail-closed)" 2 "$(run_bash_gate "$R15" 'ls -la')"
 expect_rc "empty scope.yaml: write blocked (scope_match fail-closed)" 2 "$(run_write_gate "$R15" "$R15/src/x.ts")"
-unset NS_REGISTRY
+export NS_REGISTRY="$NS_TEST_REGISTRY"
 
 # === PRE-COMMIT HOOK INJECTION (round-3 finding) ===========================
 # A planted .git/hooks/pre-commit must block the commit at gate time, even
@@ -227,6 +240,20 @@ FK
 chmod +x "$FAKE2/codex"
 R17="$(mkrepo)"; printf 'x\n' > "$R17/src/f.ts"; git -C "$R17" add src/f.ts
 expect_rc "verdict: P1 with a trailing lone 'codex' line still blocks" 2 "$(PATH="$FAKE2:$PATH" run_bash_gate "$R17" 'git commit -m x')"
+
+# === CAPACITY RETRY (transient codex "at capacity") ========================
+export NS_CAPACITY_BACKOFF_SEC=0   # no real backoff sleep in tests
+# persistent capacity -> retries then blocks fail-closed
+R18="$(mkrepo)"; printf 'x\n' > "$R18/src/feature.ts"; git -C "$R18" add src/feature.ts
+NS_FAKE_CODEX_MODE=capacity; export NS_FAKE_CODEX_MODE
+expect_rc "capacity: commit blocked after 3 retries (fail-closed)" 2 "$(run_bash_gate "$R18" 'git commit -m x')"
+unset NS_FAKE_CODEX_MODE
+# capacity clears by the 3rd try -> commit allowed
+R19="$(mkrepo)"; printf 'x\n' > "$R19/src/feature.ts"; git -C "$R19" add src/feature.ts
+CF="$WORK/cap-counter.$RANDOM"; : > "$CF"
+NS_FAKE_CODEX_MODE=capacity_then_clean; NS_FAKE_COUNTER="$CF"; export NS_FAKE_CODEX_MODE NS_FAKE_COUNTER
+expect_rc "capacity: commit allowed once capacity clears (retry succeeds)" 0 "$(run_bash_gate "$R19" 'git commit -m x')"
+unset NS_FAKE_CODEX_MODE NS_FAKE_COUNTER NS_CAPACITY_BACKOFF_SEC
 
 printf '\nintegration tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

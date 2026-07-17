@@ -131,8 +131,69 @@ def normalize_newlines(cmd):
     return ''.join(res)
 
 
+def _heredoc_delim(line):
+    """If `line` opens a heredoc (an UNQUOTED `<<[-]['"]?WORD`), return the
+    delimiter WORD; else None. Quote-aware so `echo "a << b"` and a commit
+    message mentioning `<<` are not mistaken for heredocs. `<<<` (here-strings)
+    have no body and are ignored."""
+    i, n, q = 0, len(line), None
+    while i < n:
+        c = line[i]
+        if q:
+            if c == '\\' and q == '"' and i + 1 < n:
+                i += 2; continue
+            if c == q:
+                q = None
+            i += 1; continue
+        if c in ('"', "'"):
+            q = c; i += 1; continue
+        if c == '\\' and i + 1 < n:
+            i += 2; continue
+        if c == '<' and i + 1 < n and line[i + 1] == '<':
+            j = i + 2
+            if j < n and line[j] == '<':        # <<< here-string: no body
+                i = j + 1; continue
+            if j < n and line[j] == '-':
+                j += 1
+            while j < n and line[j] in ' \t':
+                j += 1
+            if j < n and line[j] in ('"', "'"):
+                j += 1
+            ws = j
+            while j < n and (line[j].isalnum() or line[j] == '_'):
+                j += 1
+            if j > ws:
+                return line[ws:j]               # first heredoc opened on the line
+            i = j; continue
+        i += 1
+    return None
+
+
+def strip_heredocs(cmd):
+    """Remove heredoc BODIES (stdin data, not command tokens) so their content
+    (apostrophes, quotes, etc.) can't break tokenization. The `<<DELIM` marker
+    is kept, so a shell fed by a heredoc is still denied downstream."""
+    if '<<' not in cmd:
+        return cmd
+    lines = cmd.split('\n')
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        delim = _heredoc_delim(line)
+        if delim is not None:
+            while i < len(lines):
+                if lines[i].strip() == delim:
+                    i += 1
+                    break
+                i += 1
+    return '\n'.join(out)
+
+
 def tokenize(cmd):
-    lex = shlex.shlex(normalize_newlines(cmd), posix=True, punctuation_chars=True)
+    lex = shlex.shlex(normalize_newlines(strip_heredocs(cmd)), posix=True,
+                      punctuation_chars=True)
     lex.whitespace_split = True
     return list(lex)
 

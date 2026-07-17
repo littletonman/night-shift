@@ -125,14 +125,39 @@ ns_run_commit_gate() {
   done < <(ns_scope_list "$scope" gate.fast_checks)
 
   # --- 5. Codex review (adversarial gate; FAIL CLOSED) -------------------
+  # Review in a READ-ONLY sandbox. Verified empirically: read-only stops Codex
+  # from running `next build` during review (it reviews by reading the diff),
+  # which is what cost real review rounds when the build failed EROFS — while
+  # fully preserving review depth (it still catches [P1] security regressions).
+  # Build + full tests are verified in CI (and the agent's own validation), not
+  # here. A custom review prompt can't combine with --uncommitted, and isn't
+  # needed once the sandbox is read-only.
   ns_require_tool codex
-  local codex_effort codex_timeout out rc
+  local codex_effort codex_timeout out rc attempt backoff
   codex_effort="$(ns_scope_get "$scope" gate.codex_effort high)"
   codex_timeout="$(ns_scope_get "$scope" gate.codex_timeout_sec 540)"
+  backoff="${NS_CAPACITY_BACKOFF_SEC:-10}"
   out="$(mktemp 2>/dev/null || echo /tmp/ns-codex.$$)"
-  ( cd "$root" && timeout "${codex_timeout}s" \
-      codex review --uncommitted -c "model_reasoning_effort=\"$codex_effort\"" ) >"$out" 2>&1
-  rc=$?
+  # Retry TRANSIENT "model at capacity" errors with backoff before falling to
+  # the fail-closed path. Capacity is self-healing; a genuine outage
+  # (auth/quota/not-installed) is not, and is handled below.
+  rc=0
+  for attempt in 1 2 3; do
+    : > "$out"
+    ( cd "$root" && timeout "${codex_timeout}s" \
+        codex review --uncommitted \
+          -c "model_reasoning_effort=\"$codex_effort\"" \
+          -c 'sandbox_mode="read-only"' ) >"$out" 2>&1
+    rc=$?
+    [ "$rc" -eq 0 ] && break
+    [ "$rc" -eq 124 ] && break     # timeout: not a capacity case
+    if grep -qiE 'at capacity|try a different model|overloaded|temporarily unavailable' "$out"; then
+      ns_log "commit gate: Codex at capacity (attempt $attempt/3) — backing off"
+      [ "$attempt" -lt 3 ] && [ "$backoff" -gt 0 ] && sleep $(( attempt * backoff ))
+      continue
+    fi
+    break                          # other non-zero -> genuine failure (handled below)
+  done
 
   if [ "$rc" -eq 124 ]; then
     ns_log "commit gate: codex TIMED OUT after ${codex_timeout}s"
@@ -140,9 +165,17 @@ ns_run_commit_gate() {
     ns_block "commit BLOCKED — Codex review timed out after ${codex_timeout}s (fail-closed). The diff is likely too large; split this task into smaller commits and try again."
   fi
   if [ "$rc" -ne 0 ]; then
-    ns_log "commit gate: codex FAILED rc=$rc"
-    ns_ntfy high "night-shift: Codex unavailable" "commit gate in $root: codex exited $rc (fail-closed, commits blocked)"
-    ns_block "$(printf 'commit BLOCKED — Codex review did not complete (exit %s, fail-closed).\nCodex is the mandatory review gate; when it cannot run, commits stop. Check `codex login status` and quota.\nLast output:\n%s' "$rc" "$(tail -20 "$out")")"
+    if grep -qiE 'at capacity|try a different model|overloaded|temporarily unavailable' "$out"; then
+      # transient, self-healing — don't page urgently, don't let the agent
+      # "fix" it in code; tell it to wait and retry the commit.
+      ns_log "commit gate: Codex still at capacity after 3 retries"
+      ns_ntfy default "night-shift: Codex at capacity" "commit gate in $root: model at capacity after 3 retries (transient)"
+      ns_block "$(printf 'commit BLOCKED — Codex is at capacity after 3 retries (transient, NOT a code problem). Wait a moment and run the same commit again; it will likely go through. Do NOT change the code to work around this.\nLast output:\n%s' "$(tail -8 "$out")")"
+    else
+      ns_log "commit gate: codex FAILED rc=$rc"
+      ns_ntfy high "night-shift: Codex unavailable" "commit gate in $root: codex exited $rc (fail-closed, commits blocked)"
+      ns_block "$(printf 'commit BLOCKED — Codex review did not complete (exit %s, fail-closed).\nCodex is the mandatory review gate; when it cannot run, commits stop. Check `codex login status` and quota.\nLast output:\n%s' "$rc" "$(tail -20 "$out")")"
+    fi
   fi
 
   # Positive-completion parse: banner + a `codex` verdict turn must exist, and

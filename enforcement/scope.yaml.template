@@ -31,9 +31,10 @@ allow_paths:
 deny_paths:
   - ".github/workflows/**"     # CI definitions — the L1 guarantee lives here
   - ".claude/**"               # agent settings
-  - ".night-shift/**"          # run state + this contract
   - "hooks/**"                 # any in-repo hook scripts
-  - "scope.yaml"               # this file, at any depth
+  - "scope.yaml"               # the contract, at any depth (protects .night-shift/scope.yaml)
+  # NOTE: do NOT deny all of .night-shift/** — the agent writes its own run state
+  # (state.json, handoff) under .night-shift/runs/. Only scope.yaml needs protecting.
   - "**/.env*"                 # secrets (defense-in-depth; also secret-scanned)
   - "infra/**"                 # infrastructure-as-code
   - "**/migrations/**"         # DB migrations (migration_policy: deny)
@@ -71,7 +72,7 @@ gate:
   # hook timeout on large suites.
   full_checks: []
 
-  codex_effort: high          # high everywhere to start; tune down with data
+  codex_effort: xhigh         # deepest review; tune down with data if quota is tight
   codex_timeout_sec: 540      # fail-closed if Codex exceeds this (hook cap ~600s)
   max_review_rounds: 10       # after N consecutive P1/P2 rounds: revert + block
   require_secret_scan: true   # gitleaks on the staged diff; block on any hit
