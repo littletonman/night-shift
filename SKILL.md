@@ -889,10 +889,23 @@ Before marking the task complete:
    push time.
 2. Verify the task's deliverables are actually delivered.
 3. **For UI tasks** (templates, pages, CSS, frontend components):
-
-  verification MUST include opening the page in a browser (playwright,
+   verification MUST include opening the page in a browser (playwright,
    browse, or preview) and screenshotting as evidence. "Tests pass" is NOT
    sufficient for UI work.
+
+   **Reuse the project's dev server — never start a competing one.** Most dev
+   servers (Next, Vite) hold a one-instance-per-project lock, so a second launch
+   fails with `another dev server is already running` or `EADDRINUSE`. That
+   error means one is ALREADY up: reuse it — point your browser/Playwright at
+   its URL. It is never a reason to switch bundlers, add flags, or debug the
+   framework (that path burns hours on a phantom bug). First check whether the
+   app is already serving — the actual port may differ from the default (e.g.
+   Next falls through 3000→3003 when ports are taken), so list listeners
+   (`ss -ltnp | grep next`) rather than assuming. Start a server yourself only
+   if nothing is serving, run it in the background, and tear down only what YOU
+   started — never the operator's. To load a startup-only config change
+   (e.g. `next.config.ts`, read once at boot) without disturbing the running
+   server, use a separate port or a throwaway git worktree, then clean it up.
 4. Check no unintended files were modified.
 
 **Validation failure is a hard stop.** If tests fail:
