@@ -21,6 +21,7 @@ NS_TEST_REGISTRY="$WORK/no-such-registry.list"; export NS_REGISTRY="$NS_TEST_REG
 FAKEBIN="$WORK/bin"; mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/codex" <<'FAKE'
 #!/usr/bin/env bash
+[ -n "$NS_FAKE_ARGS_LOG" ] && printf '%s\n' "$*" >> "$NS_FAKE_ARGS_LOG"
 mode="${NS_FAKE_CODEX_MODE:-clean}"
 case "$mode" in
   crash) echo "boom" >&2; exit 3 ;;
@@ -128,6 +129,18 @@ R4="$(mkrepo)"; printf 'good\n' > "$R4/src/feature.ts"; git -C "$R4" add src/fea
 NS_FAKE_CODEX_MODE=clean
 export NS_FAKE_CODEX_MODE
 expect_rc "commit allowed when in-scope + codex clean" 0 "$(run_bash_gate "$R4" 'git commit -m x')"
+
+# regression: the codex review call must neutralize the agent-writable AGENTS.md
+# (project_doc_max_bytes=0) and keep the read-only sandbox — both are load-bearing.
+R4b="$(mkrepo)"; printf 'good\n' > "$R4b/src/feature.ts"; git -C "$R4b" add src/feature.ts
+NS_FAKE_CODEX_MODE=clean; export NS_FAKE_CODEX_MODE
+ALOG="$WORK/codex-args.log"; : > "$ALOG"; export NS_FAKE_ARGS_LOG="$ALOG"
+run_bash_gate "$R4b" 'git commit -m x' >/dev/null
+grep -q 'project_doc_max_bytes=0' "$ALOG"
+expect_rc "codex review neutralizes AGENTS.md (project_doc_max_bytes=0)" 0 "$?"
+grep -q 'sandbox_mode="read-only"' "$ALOG"
+expect_rc "codex review keeps the read-only sandbox" 0 "$?"
+unset NS_FAKE_ARGS_LOG
 
 # in-scope + clean + fake codex DIRTY (P1) => blocked
 R5="$(mkrepo)"; printf 'bug\n' > "$R5/src/feature.ts"; git -C "$R5" add src/feature.ts
