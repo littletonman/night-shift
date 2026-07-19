@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """supervisor.py — drive a night-shift run non-interactively, watch it, escalate.
 
-This is the host process that turns the /night-shift skill from "a thing you
-babysit" into "a thing that runs itself". It:
+The host process that turns the /night-shift skill from "a thing you babysit"
+into "a thing that runs itself". It:
 
-  1. launches Claude headless in supervised mode (no interactive pre-flight),
+  1. launches Claude headless in supervised mode — locally OR in a container,
   2. watches the run's own on-disk artifacts for a progress heartbeat,
   3. escalates via ntfy on stall / blocker / completion,
   4. kills a hung run so it can't idle for hours, and leaves its state clean.
 
 Progress is read from the artifacts the agent already writes as its source of
-truth — `.night-shift/runs/*/state.json` and `.night-shift/enforce.log` — so it
-does not depend on parsing Claude's output stream.
+truth — `.night-shift/runs/*/state.json` and `.night-shift/enforce.log`. Those
+land in the (possibly volume-mounted) repo, so monitoring is identical whether
+the run is local or containerized.
 
-Usage:
+Usage (local):
   supervisor.py --repo /path/to/project --objective "build milestone m2 ..." \
-                [--ntfy-topic ns-foo] [--branch ns/staging] \
-                [--database-url postgresql://...] \
-                [--stall-min 20] [--kill-mult 2] [--max-hours 9]
+                [--ntfy-topic ns-foo] [--branch ns/staging] [--database-url ...]
 
-Requires: claude on PATH; the repo already onboarded (root-owned scope.yaml).
+Usage (container):
+  supervisor.py --repo /path/to/project --objective "..." \
+                --container night-shift-agent:latest \
+                [--db-image postgres:16] [--net ns-net] [--db-name weather_app]
+
+Requires: claude on PATH (local) or docker + a built image (container).
 Stdlib only (PyYAML optional, only for --manifest).
 """
 import argparse
@@ -34,6 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 POLL_SECONDS = 30
+DEVNULL = subprocess.DEVNULL
 
 
 def log(msg):
@@ -63,7 +68,6 @@ def runs_dir(repo):
 
 
 def latest_state(repo):
-    """Return (path, dict) of the newest run's state.json, or (None, None)."""
     states = sorted(runs_dir(repo).glob("*/state.json"), key=lambda p: p.stat().st_mtime)
     if not states:
         return None, None
@@ -75,7 +79,6 @@ def latest_state(repo):
 
 
 def heartbeat_mtime(repo):
-    """Newest mtime across all run state + the enforce log = 'agent did something'."""
     latest = 0.0
     enforce = Path(repo) / ".night-shift" / "enforce.log"
     if enforce.exists():
@@ -96,12 +99,10 @@ def git_head(repo):
 
 def kr_progress(state):
     krs = (state or {}).get("key_results") or []
-    done = sum(1 for k in krs if k.get("status") == "completed")
-    return done, len(krs)
+    return sum(1 for k in krs if k.get("status") == "completed"), len(krs)
 
 
 def active_run_exists(repo):
-    """A run is active if any state.json says status:running (the pre-flight guard)."""
     for p in runs_dir(repo).glob("*/state.json"):
         try:
             if json.loads(p.read_text()).get("status") == "running":
@@ -114,26 +115,101 @@ def active_run_exists(repo):
 TERMINAL = {"completed", "hard-capped", "interrupted", "failed"}
 
 
-# --- launch + monitor --------------------------------------------------------
-def launch(repo, objective, branch, database_url, log_path):
+# --- docker helpers ----------------------------------------------------------
+def _docker(*args, check=True, capture=False):
+    r = subprocess.run(
+        ["docker", *args], text=True,
+        stdout=(subprocess.PIPE if capture else DEVNULL),
+        stderr=(subprocess.PIPE if capture else DEVNULL),
+    )
+    if check and r.returncode != 0:
+        raise RuntimeError(f"docker {' '.join(args)} failed: {(r.stderr or '').strip() or r.returncode}")
+    return (r.stdout or "").strip()
+
+
+def ensure_network(net):
+    if net not in _docker("network", "ls", "--format", "{{.Name}}", capture=True, check=False).split():
+        _docker("network", "create", net)
+        log(f"created docker network {net}")
+
+
+def ensure_db(net, project, db_image, db_name):
+    name = f"ns-db-{project}"
+    running = name in _docker("ps", "--format", "{{.Names}}", capture=True, check=False).split()
+    if not running:
+        _docker("rm", "-f", name, check=False)
+        _docker("run", "-d", "--name", name, "--network", net,
+                "-e", "POSTGRES_PASSWORD=dev", "-e", f"POSTGRES_DB={db_name}", db_image)
+        log(f"started sibling DB {name} ({db_image})")
+    for _ in range(30):
+        if subprocess.run(["docker", "exec", name, "pg_isready", "-U", "postgres"],
+                          stdout=DEVNULL, stderr=DEVNULL).returncode == 0:
+            break
+        time.sleep(2)
+    return f"postgresql://postgres:dev@{name}:5432/{db_name}"
+
+
+# --- launch (local or container) ---------------------------------------------
+def _base_env(objective, branch, database_url):
     env = dict(os.environ)
-    env["NIGHT_SHIFT_SUPERVISED"] = "1"
-    env["NIGHT_SHIFT_OBJECTIVE"] = objective
-    env["NIGHT_SHIFT_BRANCH"] = branch
+    env.update(NIGHT_SHIFT_SUPERVISED="1", NIGHT_SHIFT_OBJECTIVE=objective,
+               NIGHT_SHIFT_BRANCH=branch)
     if database_url:
         env["DATABASE_URL"] = database_url
+    return env
+
+
+def launch_local(repo, objective, branch, database_url, log_path):
     logf = open(log_path, "wb")
     proc = subprocess.Popen(
         ["claude", "-p", "--dangerously-skip-permissions",
          "--output-format", "stream-json", "--verbose", "/night-shift"],
-        cwd=repo, env=env, stdout=logf, stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL, start_new_session=True,
+        cwd=repo, env=_base_env(objective, branch, database_url),
+        stdout=logf, stderr=subprocess.STDOUT, stdin=DEVNULL, start_new_session=True,
     )
-    return proc, logf
+    return {"kind": "local", "proc": proc}, logf
+
+
+def launch_container(image, repo, objective, branch, database_url, net, log_path):
+    name = f"ns-run-{int(time.time())}"
+    home = str(Path.home())
+    args = ["run", "--rm", "--name", name,
+            "-v", f"{repo}:{repo}",
+            "-v", f"{home}/.claude:/host/.claude:ro",
+            "-v", f"{home}/.codex:/host/.codex:ro",
+            "-e", f"NS_REPO={repo}",
+            "-e", "NIGHT_SHIFT_SUPERVISED=1",
+            "-e", f"NIGHT_SHIFT_OBJECTIVE={objective}",
+            "-e", f"NIGHT_SHIFT_BRANCH={branch}"]
+    if net:
+        args += ["--network", net]
+    if database_url:
+        args += ["-e", f"DATABASE_URL={database_url}"]
+    args.append(image)
+    logf = open(log_path, "wb")
+    proc = subprocess.Popen(["docker", *args], stdout=logf, stderr=subprocess.STDOUT,
+                            stdin=DEVNULL, start_new_session=True)
+    log(f"launched container {name} ({image})")
+    return {"kind": "container", "proc": proc, "name": name}, logf
+
+
+def terminate(handle):
+    if handle["kind"] == "container":
+        subprocess.run(["docker", "kill", handle["name"]], stdout=DEVNULL, stderr=DEVNULL)
+        return
+    try:
+        os.killpg(os.getpgid(handle["proc"].pid), signal.SIGTERM)
+    except Exception:  # noqa: BLE001
+        pass
+    time.sleep(3)
+    if handle["proc"].poll() is None:
+        try:
+            os.killpg(os.getpgid(handle["proc"].pid), signal.SIGKILL)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def mark_interrupted(repo, reason):
-    """Flip the running state to interrupted so the next run isn't blocked."""
     p, state = latest_state(repo)
     if p and state and state.get("status") == "running":
         state["status"] = "interrupted"
@@ -145,16 +221,19 @@ def mark_interrupted(repo, reason):
             log(f"could not mark interrupted ({e})")
 
 
-def monitor(repo, proc, topic, stall_min, kill_mult, max_hours):
-    stall_s = stall_min * 60
-    kill_s = stall_s * kill_mult
-    max_s = max_hours * 3600
+# --- monitor -----------------------------------------------------------------
+def monitor(repo, handle, topic, stall_min, kill_mult, max_hours):
+    proc = handle["proc"]
+    stall_s, kill_s, max_s = stall_min * 60, stall_min * 60 * kill_mult, max_hours * 3600
     started = time.time()
-    last_beat = heartbeat_mtime(repo)
-    last_beat_at = time.time()
-    last_head = git_head(repo)
-    last_done = -1
-    stall_alerted = False
+    last_beat, last_beat_at = heartbeat_mtime(repo), time.time()
+    last_head, last_done, stall_alerted = git_head(repo), -1, False
+
+    def stop(kind, msg, tags):
+        log(msg)
+        ntfy(topic, f"night-shift: {kind}", f"{Path(repo).name}: {msg}", priority="high", tags=tags)
+        terminate(handle)
+        mark_interrupted(repo, msg)
 
     while True:
         rc = proc.poll()
@@ -164,7 +243,6 @@ def monitor(repo, proc, topic, stall_min, kill_mult, max_hours):
         if beat > last_beat:
             last_beat, last_beat_at, stall_alerted = beat, now, False
 
-        # milestone signals: a new commit, or a newly-completed key result
         head = git_head(repo)
         if head and head != last_head:
             log(f"new commit {head[:8]}")
@@ -174,60 +252,30 @@ def monitor(repo, proc, topic, stall_min, kill_mult, max_hours):
         if total and done != last_done:
             if last_done >= 0 and done > last_done:
                 ntfy(topic, "night-shift: progress",
-                     f"{Path(repo).name}: {done}/{total} key results complete",
-                     tags="white_check_mark")
+                     f"{Path(repo).name}: {done}/{total} key results complete", tags="white_check_mark")
             last_done = done
 
-        # terminal state on disk?
         status = (state or {}).get("status")
         if status in TERMINAL:
             log(f"run reached terminal status: {status}")
             return status
-
-        # process exited
         if rc is not None:
-            log(f"claude exited rc={rc}")
+            log(f"launch process exited rc={rc}")
             _, state = latest_state(repo)
             return (state or {}).get("status") or f"exited-rc-{rc}"
 
-        # stall detection
         idle = now - last_beat_at
         if idle > kill_s:
-            log(f"HUNG: no progress for {int(idle)}s (> kill threshold) — killing")
-            ntfy(topic, "night-shift: KILLED (hung)",
-                 f"{Path(repo).name}: no progress for {int(idle//60)}m; killed. "
-                 f"Check the run and relaunch.", priority="high", tags="skull")
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except Exception:  # noqa: BLE001
-                pass
-            time.sleep(5)
-            if proc.poll() is None:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except Exception:  # noqa: BLE001
-                    pass
-            mark_interrupted(repo, f"supervisor killed after {int(idle)}s idle")
+            stop("KILLED (hung)", f"no progress for {int(idle//60)}m; killed", "skull")
             return "killed-hung"
         if idle > stall_s and not stall_alerted:
             log(f"stall: no progress for {int(idle)}s — alerting")
             ntfy(topic, "night-shift: stalled",
                  f"{Path(repo).name}: no progress for {int(idle//60)}m. "
-                 f"Still watching; will kill at {int(kill_s//60)}m.",
-                 priority="high", tags="warning")
+                 f"Will kill at {int(kill_s//60)}m.", priority="high", tags="warning")
             stall_alerted = True
-
-        # wall-clock backstop (the agent self-caps at 8h; this catches a runaway)
         if now - started > max_s:
-            log(f"max wall-clock {max_hours}h exceeded — killing")
-            ntfy(topic, "night-shift: max runtime hit",
-                 f"{Path(repo).name}: exceeded {max_hours}h wall clock; killed.",
-                 priority="high", tags="hourglass")
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except Exception:  # noqa: BLE001
-                pass
-            mark_interrupted(repo, f"supervisor killed at {max_hours}h wall clock")
+            stop("max runtime hit", f"exceeded {max_hours}h wall clock; killed", "hourglass")
             return "killed-maxtime"
 
         time.sleep(POLL_SECONDS)
@@ -237,12 +285,9 @@ def read_manifest(path):
     try:
         import yaml  # provided by the enforcement install (python3-yaml)
     except ImportError:
-        sys.exit("PyYAML not available; pass --repo/--ntfy-topic explicitly instead of --manifest")
+        sys.exit("PyYAML unavailable; pass --repo/--ntfy-topic instead of --manifest")
     m = yaml.safe_load(Path(path).read_text())
-    return {
-        "repo": m.get("repo"),
-        "ntfy": (m.get("notify") or {}).get("ntfy_topic"),
-    }
+    return {"repo": m.get("repo"), "ntfy": (m.get("notify") or {}).get("ntfy_topic")}
 
 
 def main():
@@ -256,57 +301,67 @@ def main():
     ap.add_argument("--stall-min", type=int, default=20, help="alert if no progress for N min")
     ap.add_argument("--kill-mult", type=int, default=2, help="kill at stall-min * this")
     ap.add_argument("--max-hours", type=float, default=9.0, help="wall-clock backstop")
+    # container mode
+    ap.add_argument("--container", metavar="IMAGE", help="run in this docker image instead of locally")
+    ap.add_argument("--net", default="ns-net", help="docker network for container runs")
+    ap.add_argument("--db-image", help="bring up a sibling Postgres on --net (e.g. postgres:16)")
+    ap.add_argument("--db-name", help="database name for the sibling DB (default: derived from repo)")
     args = ap.parse_args()
 
     repo, topic = args.repo, args.ntfy_topic
     if args.manifest:
         mf = read_manifest(args.manifest)
-        repo = repo or mf["repo"]
-        topic = topic or mf["ntfy"]
+        repo, topic = repo or mf["repo"], topic or mf["ntfy"]
     if not repo:
         sys.exit("need --repo or --manifest with repo:")
     repo = str(Path(repo).resolve())
+    project = Path(repo).name
 
-    # pre-checks
     if not (Path(repo) / ".night-shift" / "scope.yaml").exists():
         sys.exit(f"{repo} is not onboarded (no root-owned .night-shift/scope.yaml)")
     active = active_run_exists(repo)
     if active:
-        sys.exit(f"a run is already active ({active}); refusing to start a second. "
-                 f"Finish or mark it interrupted first.")
+        sys.exit(f"a run is already active ({active}); finish or mark it interrupted first.")
+
+    database_url = args.database_url
+    if args.container:
+        ensure_network(args.net)
+        if args.db_image:
+            db_name = args.db_name or project.replace("-", "_")
+            database_url = ensure_db(args.net, project, args.db_image, db_name)
+            log(f"sibling DB ready: DATABASE_URL points at ns-db-{project}")
 
     log_path = Path(repo) / ".night-shift" / f"supervisor-{int(time.time())}.log"
-    log(f"launching supervised run in {repo}")
+    where = f"container {args.container}" if args.container else "locally"
+    log(f"launching supervised run {where} in {repo}")
     log(f"  objective: {args.objective}")
     log(f"  branch: {args.branch} | ntfy: {topic or '(none)'} | log: {log_path}")
-    ntfy(topic, "night-shift: started",
-         f"{Path(repo).name}: {args.objective[:120]}", tags="new_moon")
+    ntfy(topic, "night-shift: started", f"{project}: {args.objective[:120]}", tags="new_moon")
 
-    proc, logf = launch(repo, args.objective, args.branch, args.database_url, log_path)
+    if args.container:
+        handle, logf = launch_container(args.container, repo, args.objective, args.branch,
+                                        database_url, args.net, log_path)
+    else:
+        handle, logf = launch_local(repo, args.objective, args.branch, database_url, log_path)
+
     try:
-        outcome = monitor(repo, proc, topic, args.stall_min, args.kill_mult, args.max_hours)
+        outcome = monitor(repo, handle, topic, args.stall_min, args.kill_mult, args.max_hours)
     except KeyboardInterrupt:
         log("interrupted by operator — terminating run")
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except Exception:  # noqa: BLE001
-            pass
+        terminate(handle)
         mark_interrupted(repo, "operator ctrl-c")
         outcome = "operator-abort"
     finally:
         logf.close()
 
-    # final report
     _, state = latest_state(repo)
     done, total = kr_progress(state)
-    hp = (Path(repo) / ".night-shift" / "runs" /
-          (state or {}).get("run_id", "") / "handoff.md")
+    hp = runs_dir(repo) / (state or {}).get("run_id", "") / "handoff.md"
     log(f"DONE — outcome={outcome} | key results {done}/{total} | handoff: {hp}")
-    prio = "default" if outcome in ("completed",) else "high"
-    tag = "tada" if outcome == "completed" else "warning"
+    prio = "default" if outcome == "completed" else "high"
     ntfy(topic, f"night-shift: {outcome}",
-         f"{Path(repo).name}: {done}/{total} key results. See handoff.md.",
-         priority=prio, tags=tag)
+         f"{project}: {done}/{total} key results. See handoff.md.",
+         priority=prio, tags=("tada" if outcome == "completed" else "warning"))
     return 0 if outcome == "completed" else 1
 
 
