@@ -99,6 +99,28 @@ uncommitted changes, objective, goal approval), send a single question,
 wait for the reply, then proceed to the next check. This keeps the pre-flight
 conversational and avoids overwhelming the user with a wall of decisions.
 
+**Supervised mode (headless / no human present).** If the environment variable
+`NIGHT_SHIFT_SUPERVISED=1` is set, the run is driven by the supervisor, not a
+person — there is no one to answer, and any `AskUserQuestion` (or a message that
+waits for a reply) will HANG the run indefinitely. In this mode you MUST NOT ask
+ANY pre-flight question. Source every answer non-interactively instead:
+
+- **Bypass-permissions (§2):** assume yes — the supervisor always launches with
+  `--dangerously-skip-permissions`. Skip the confirmation entirely.
+- **Mode:** git. The supervisor guarantees a git repo; do not offer degrade mode.
+- **Branch (§6):** use `$NIGHT_SHIFT_BRANCH` if set, else `ns/staging`; create or
+  switch to it without asking.
+- **Objective (§Objective Confirmation):** take `$NIGHT_SHIFT_OBJECTIVE` (or, if
+  that is empty, the launch prompt) VERBATIM as the locked objective. There is no
+  echo-and-confirm and no yes/no — record it in `state.objective` and proceed
+  straight to the handover banner.
+
+Everything else runs normally (skill-dir resolve, dependency checks, INVARIANTS
+reachability, `state.json` init), and post-banner execution is identical. If a
+blocker arises mid-run that would normally need a human, do NOT wait — record it
+in the handoff/`state.json` and stop or route around per the usual rules; the
+supervisor escalates from those artifacts, never from a chat prompt.
+
 ### 1. Resolve the skill install directory
 
 Run this **first**, before any user prompt. It resolves the skill's install
@@ -377,6 +399,11 @@ important signal — it tells you what the user actually cares about right now.
 5. **CLAUDE.md / project docs** — Conventions and architecture.
 
 ## Objective Confirmation (the only approval gate)
+
+> **Supervised mode:** if `NIGHT_SHIFT_SUPERVISED=1`, skip this entire section's
+> yes/no — take `$NIGHT_SHIFT_OBJECTIVE` (or the launch prompt) verbatim as the
+> locked objective and go straight to the handover banner. Never ask; there is
+> no human to answer. (See §Pre-flight → Supervised mode.)
 
 The user approves only ONE thing: the objective. Key Results and tasks are
 decided iteratively during execution, each with its own Codex review.
