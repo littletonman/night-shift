@@ -35,7 +35,11 @@ inject() {
   for f in "$@"; do [ -e "$src/$f" ] && cp "$src/$f" "$dst/$f" || true; done
   chown -R node:node "$dst"
 }
-inject /host/.claude "$AGENT_HOME/.claude" .credentials.json settings.json
+# Only the OAuth credential is injected — NOT the host's settings.json, which is
+# the operator's personal interactive config (model, voice, theme) and has no
+# place in a headless autonomous run. The image bakes its own settings
+# (effortLevel: high); the model is chosen via NIGHT_SHIFT_MODEL below.
+inject /host/.claude "$AGENT_HOME/.claude" .credentials.json
 inject /host/.codex  "$AGENT_HOME/.codex"  auth.json config.toml
 [ -f "$AGENT_HOME/.claude/.credentials.json" ] || {
   echo "FATAL: no Claude credentials injected — mount ~/.claude at /host/.claude:ro"; exit 3; }
@@ -43,7 +47,11 @@ inject /host/.codex  "$AGENT_HOME/.codex"  auth.json config.toml
   echo "WARN: no Codex auth injected — the commit gate's review will fail closed."
 
 # 3. Drop to the non-root agent and run the supervised shift. NIGHT_SHIFT_SUPERVISED
-#    is forced on: a containerized run is headless by definition.
+#    is forced on: a containerized run is headless by definition. The model is
+#    operator-chosen via NIGHT_SHIFT_MODEL (unset -> the account default); the
+#    host's interactive model preference is deliberately NOT inherited.
+model_args=()
+[ -n "${NIGHT_SHIFT_MODEL:-}" ] && model_args=(--model "$NIGHT_SHIFT_MODEL")
 cd "$NS_REPO"
 export NIGHT_SHIFT_SUPERVISED=1
 exec gosu node env \
@@ -54,4 +62,5 @@ exec gosu node env \
   ${DATABASE_URL:+DATABASE_URL="$DATABASE_URL"} \
   PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
   PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/lib/node_modules/.bin" \
-  claude -p --dangerously-skip-permissions --output-format stream-json --verbose /night-shift
+  claude -p --dangerously-skip-permissions --output-format stream-json --verbose \
+    "${model_args[@]}" /night-shift

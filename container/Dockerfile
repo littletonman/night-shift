@@ -34,6 +34,19 @@ RUN npx --yes playwright@1.61.1 install --with-deps chromium \
 COPY enforcement/ /tmp/enforcement/
 RUN bash /tmp/enforcement/install.sh system && rm -rf /tmp/enforcement
 
+# 4b. Install the night-shift skill so `/night-shift` resolves for the agent.
+#     On the host this is a ~/.claude/skills/night-shift symlink to the repo; we
+#     bake the equivalent. The SKILL_DIR probe (SKILL.md pre-flight) keys on
+#     .claude-plugin/plugin.json, and INVARIANTS.md must sit beside SKILL.md.
+RUN mkdir -p /home/node/.claude/skills/night-shift/.claude-plugin
+COPY --chown=node:node SKILL.md INVARIANTS.md /home/node/.claude/skills/night-shift/
+COPY --chown=node:node .claude-plugin/plugin.json /home/node/.claude/skills/night-shift/.claude-plugin/
+# Container-appropriate agent settings: high effort (the locked "high effort
+# everywhere" decision), nothing else. The host's personal settings.json (model,
+# voice, theme) is intentionally NOT used — the model comes from NIGHT_SHIFT_MODEL.
+RUN printf '{\n  "effortLevel": "high"\n}\n' > /home/node/.claude/settings.json \
+ && chown -R node:node /home/node/.claude
+
 # 5. Entrypoint: root bootstrap -> drop to node.
 COPY container/entrypoint.sh /usr/local/bin/ns-entrypoint
 RUN chmod 755 /usr/local/bin/ns-entrypoint
