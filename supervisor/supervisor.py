@@ -159,18 +159,23 @@ def _base_env(objective, branch, database_url):
     return env
 
 
-def launch_local(repo, objective, branch, database_url, log_path):
+def launch_local(repo, objective, branch, database_url, model, log_path):
+    # --model overrides the host's ~/.claude/settings.json model (which is the
+    # operator's interactive preference, not what an autonomous shift should use).
+    cmd = ["claude", "-p", "--dangerously-skip-permissions",
+           "--output-format", "stream-json", "--verbose"]
+    if model:
+        cmd += ["--model", model]
+    cmd.append("/night-shift")
     logf = open(log_path, "wb")
     proc = subprocess.Popen(
-        ["claude", "-p", "--dangerously-skip-permissions",
-         "--output-format", "stream-json", "--verbose", "/night-shift"],
-        cwd=repo, env=_base_env(objective, branch, database_url),
+        cmd, cwd=repo, env=_base_env(objective, branch, database_url),
         stdout=logf, stderr=subprocess.STDOUT, stdin=DEVNULL, start_new_session=True,
     )
     return {"kind": "local", "proc": proc}, logf
 
 
-def launch_container(image, repo, objective, branch, database_url, net, log_path):
+def launch_container(image, repo, objective, branch, database_url, model, net, log_path):
     name = f"ns-run-{int(time.time())}"
     home = str(Path.home())
     args = ["run", "--rm", "--name", name,
@@ -181,6 +186,8 @@ def launch_container(image, repo, objective, branch, database_url, net, log_path
             "-e", "NIGHT_SHIFT_SUPERVISED=1",
             "-e", f"NIGHT_SHIFT_OBJECTIVE={objective}",
             "-e", f"NIGHT_SHIFT_BRANCH={branch}"]
+    if model:
+        args += ["-e", f"NIGHT_SHIFT_MODEL={model}"]
     if net:
         args += ["--network", net]
     if database_url:
@@ -296,6 +303,8 @@ def main():
     ap.add_argument("--repo", help="project repo path (overrides manifest)")
     ap.add_argument("--objective", required=True, help="the shift objective, verbatim")
     ap.add_argument("--branch", default="ns/staging")
+    ap.add_argument("--model", default="claude-opus-4-8",
+                    help="model for the shift (empty string = account default)")
     ap.add_argument("--ntfy-topic", help="ntfy topic (overrides manifest)")
     ap.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
     ap.add_argument("--stall-min", type=int, default=20, help="alert if no progress for N min")
@@ -335,14 +344,16 @@ def main():
     where = f"container {args.container}" if args.container else "locally"
     log(f"launching supervised run {where} in {repo}")
     log(f"  objective: {args.objective}")
-    log(f"  branch: {args.branch} | ntfy: {topic or '(none)'} | log: {log_path}")
+    log(f"  branch: {args.branch} | model: {args.model or '(account default)'} "
+        f"| ntfy: {topic or '(none)'} | log: {log_path}")
     ntfy(topic, "night-shift: started", f"{project}: {args.objective[:120]}", tags="new_moon")
 
     if args.container:
         handle, logf = launch_container(args.container, repo, args.objective, args.branch,
-                                        database_url, args.net, log_path)
+                                        database_url, args.model, args.net, log_path)
     else:
-        handle, logf = launch_local(repo, args.objective, args.branch, database_url, log_path)
+        handle, logf = launch_local(repo, args.objective, args.branch, database_url,
+                                    args.model, log_path)
 
     try:
         outcome = monitor(repo, handle, topic, args.stall_min, args.kill_mult, args.max_hours)
