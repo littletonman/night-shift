@@ -67,8 +67,15 @@ def runs_dir(repo):
     return Path(repo) / ".night-shift" / "runs"
 
 
-def latest_state(repo):
-    states = sorted(runs_dir(repo).glob("*/state.json"), key=lambda p: p.stat().st_mtime)
+def latest_state(repo, ignore_dirs=frozenset()):
+    # ignore_dirs excludes run directories that already existed before THIS
+    # supervised run launched — otherwise a prior run's terminal state.json
+    # (e.g. a previous "completed") is the newest by mtime and the monitor would
+    # mistake it for this run finishing the instant it starts.
+    states = sorted(
+        (p for p in runs_dir(repo).glob("*/state.json") if str(p.parent) not in ignore_dirs),
+        key=lambda p: p.stat().st_mtime,
+    )
     if not states:
         return None, None
     p = states[-1]
@@ -229,7 +236,7 @@ def mark_interrupted(repo, reason):
 
 
 # --- monitor -----------------------------------------------------------------
-def monitor(repo, handle, topic, stall_min, kill_mult, max_hours):
+def monitor(repo, handle, topic, stall_min, kill_mult, max_hours, ignore_dirs=frozenset()):
     proc = handle["proc"]
     stall_s, kill_s, max_s = stall_min * 60, stall_min * 60 * kill_mult, max_hours * 3600
     started = time.time()
@@ -254,7 +261,7 @@ def monitor(repo, handle, topic, stall_min, kill_mult, max_hours):
         if head and head != last_head:
             log(f"new commit {head[:8]}")
             last_head = head
-        _, state = latest_state(repo)
+        _, state = latest_state(repo, ignore_dirs)
         done, total = kr_progress(state)
         if total and done != last_done:
             if last_done >= 0 and done > last_done:
@@ -268,7 +275,7 @@ def monitor(repo, handle, topic, stall_min, kill_mult, max_hours):
             return status
         if rc is not None:
             log(f"launch process exited rc={rc}")
-            _, state = latest_state(repo)
+            _, state = latest_state(repo, ignore_dirs)
             return (state or {}).get("status") or f"exited-rc-{rc}"
 
         idle = now - last_beat_at
@@ -340,6 +347,10 @@ def main():
             database_url = ensure_db(args.net, project, args.db_image, db_name)
             log(f"sibling DB ready: DATABASE_URL points at ns-db-{project}")
 
+    # Snapshot run dirs that already exist so the monitor ignores prior runs'
+    # terminal state and only tracks the one this invocation is about to start.
+    preexisting = {str(p.parent) for p in runs_dir(repo).glob("*/state.json")}
+
     log_path = Path(repo) / ".night-shift" / f"supervisor-{int(time.time())}.log"
     where = f"container {args.container}" if args.container else "locally"
     log(f"launching supervised run {where} in {repo}")
@@ -356,7 +367,8 @@ def main():
                                     args.model, log_path)
 
     try:
-        outcome = monitor(repo, handle, topic, args.stall_min, args.kill_mult, args.max_hours)
+        outcome = monitor(repo, handle, topic, args.stall_min, args.kill_mult,
+                          args.max_hours, preexisting)
     except KeyboardInterrupt:
         log("interrupted by operator — terminating run")
         terminate(handle)
@@ -365,7 +377,7 @@ def main():
     finally:
         logf.close()
 
-    _, state = latest_state(repo)
+    _, state = latest_state(repo, preexisting)
     done, total = kr_progress(state)
     hp = runs_dir(repo) / (state or {}).get("run_id", "") / "handoff.md"
     log(f"DONE — outcome={outcome} | key results {done}/{total} | handoff: {hp}")
