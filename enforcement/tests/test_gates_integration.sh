@@ -140,7 +140,19 @@ grep -q 'project_doc_max_bytes=0' "$ALOG"
 expect_rc "codex review neutralizes AGENTS.md (project_doc_max_bytes=0)" 0 "$?"
 grep -q 'sandbox_mode="read-only"' "$ALOG"
 expect_rc "codex review keeps the read-only sandbox" 0 "$?"
+grep -q 'model="gpt-5.6-terra"' "$ALOG"
+expect_rc "codex review pins the review model (gate.codex_model default)" 0 "$?"
 unset NS_FAKE_ARGS_LOG
+
+# regression: an operator-set NS_CODEX_REVIEW_MODEL (the run-config env path)
+# overrides the baked default — models travel as env, not baked into the image.
+R4c="$(mkrepo)"; printf 'good\n' > "$R4c/src/feature.ts"; git -C "$R4c" add src/feature.ts
+ALOG2="$WORK/codex-args2.log"; : > "$ALOG2"; export NS_FAKE_ARGS_LOG="$ALOG2"
+NS_CODEX_REVIEW_MODEL="gpt-5.6-terra-override"; export NS_CODEX_REVIEW_MODEL
+run_bash_gate "$R4c" 'git commit -m x' >/dev/null
+grep -q 'model="gpt-5.6-terra-override"' "$ALOG2"
+expect_rc "review model honors NS_CODEX_REVIEW_MODEL over the baked default" 0 "$?"
+unset NS_CODEX_REVIEW_MODEL NS_FAKE_ARGS_LOG
 
 # in-scope + clean + fake codex DIRTY (P1) => blocked
 R5="$(mkrepo)"; printf 'bug\n' > "$R5/src/feature.ts"; git -C "$R5" add src/feature.ts

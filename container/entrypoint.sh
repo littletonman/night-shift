@@ -46,6 +46,13 @@ inject /host/.codex  "$AGENT_HOME/.codex"  auth.json config.toml
 [ -f "$AGENT_HOME/.codex/auth.json" ] || \
   echo "WARN: no Codex auth injected — the commit gate's review will fail closed."
 
+# 2b. Reasoning effort is operator-chosen via NIGHT_SHIFT_EFFORT (default high,
+#     matching the baked settings). Written into the agent's settings.json at each
+#     start so a run can select xhigh without rebuilding the image.
+printf '{\n  "effortLevel": "%s"\n}\n' "${NIGHT_SHIFT_EFFORT:-high}" \
+  > "$AGENT_HOME/.claude/settings.json"
+chown node:node "$AGENT_HOME/.claude/settings.json"
+
 # 3. Drop to the non-root agent and run the supervised shift. NIGHT_SHIFT_SUPERVISED
 #    is forced on: a containerized run is headless by definition. The model is
 #    operator-chosen via NIGHT_SHIFT_MODEL (unset -> the account default); the
@@ -60,6 +67,10 @@ exec gosu node env \
   NIGHT_SHIFT_OBJECTIVE="${NIGHT_SHIFT_OBJECTIVE:-}" \
   NIGHT_SHIFT_BRANCH="${NIGHT_SHIFT_BRANCH:-ns/staging}" \
   ${DATABASE_URL:+DATABASE_URL="$DATABASE_URL"} \
+  ${NS_CODEX_PLAN_MODEL:+NS_CODEX_PLAN_MODEL="$NS_CODEX_PLAN_MODEL"} \
+  ${NS_CODEX_PLAN_EFFORT:+NS_CODEX_PLAN_EFFORT="$NS_CODEX_PLAN_EFFORT"} \
+  ${NS_CODEX_REVIEW_MODEL:+NS_CODEX_REVIEW_MODEL="$NS_CODEX_REVIEW_MODEL"} \
+  ${NS_CODEX_REVIEW_EFFORT:+NS_CODEX_REVIEW_EFFORT="$NS_CODEX_REVIEW_EFFORT"} \
   PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
   PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/lib/node_modules/.bin" \
   claude -p --dangerously-skip-permissions --output-format stream-json --verbose \

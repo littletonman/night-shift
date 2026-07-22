@@ -684,7 +684,9 @@ inline in the prompt, or reference both file paths explicitly).
 # $PROMPT = state.json contents (verbatim) + proposed-key-result.md, bundled
 #           as a single adversarial-review prompt describing what to evaluate.
 # $OUT    = $RUN_DIR/key-results/<G>/codex-approval.txt
-echo "$PROMPT" | codex exec - -s read-only -c 'model_reasoning_effort="xhigh"' 2>&1 \
+echo "$PROMPT" | codex exec - -s read-only \
+  -c "model=\"${NS_CODEX_PLAN_MODEL:-gpt-5.6-sol}\"" \
+  -c "model_reasoning_effort=\"${NS_CODEX_PLAN_EFFORT:-xhigh}\"" 2>&1 \
   | tee "$OUT" >/dev/null
 ```
 
@@ -742,7 +744,9 @@ average so estimates remain useful.
 ```bash
 # $PROMPT = state.json (verbatim) + current-decomp.md.
 # $OUT    = $RUN_DIR/key-results/<G>/decomp-adversarial.txt
-echo "$PROMPT" | codex exec - -s read-only -c 'model_reasoning_effort="xhigh"' 2>&1 \
+echo "$PROMPT" | codex exec - -s read-only \
+  -c "model=\"${NS_CODEX_PLAN_MODEL:-gpt-5.6-sol}\"" \
+  -c "model_reasoning_effort=\"${NS_CODEX_PLAN_EFFORT:-xhigh}\"" 2>&1 \
   | tee "$OUT" >/dev/null
 ```
 
@@ -1154,7 +1158,9 @@ key result would over-engineer or over-optimize the objective:
   ```bash
   # $PROMPT = the scaffold above with state.json + draft + objective inlined.
   # $OUT    = $RUN_DIR/end-consensus.txt
-  echo "$PROMPT" | codex exec - -s read-only -c 'model_reasoning_effort="xhigh"' 2>&1 \
+  echo "$PROMPT" | codex exec - -s read-only \
+    -c "model=\"${NS_CODEX_PLAN_MODEL:-gpt-5.6-sol}\"" \
+    -c "model_reasoning_effort=\"${NS_CODEX_PLAN_EFFORT:-xhigh}\"" 2>&1 \
     | tee "$OUT" >/dev/null
   ```
 3. Save Codex's response to `$RUN_DIR/end-consensus.txt`. Update

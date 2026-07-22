@@ -166,7 +166,7 @@ def _base_env(objective, branch, database_url):
     return env
 
 
-def launch_local(repo, objective, branch, database_url, model, log_path):
+def launch_local(repo, objective, branch, database_url, model, env_extra, log_path):
     # --model overrides the host's ~/.claude/settings.json model (which is the
     # operator's interactive preference, not what an autonomous shift should use).
     cmd = ["claude", "-p", "--dangerously-skip-permissions",
@@ -174,15 +174,17 @@ def launch_local(repo, objective, branch, database_url, model, log_path):
     if model:
         cmd += ["--model", model]
     cmd.append("/night-shift")
+    env = _base_env(objective, branch, database_url)
+    env.update(env_extra)  # per-run model/effort config (NS_CODEX_* etc.)
     logf = open(log_path, "wb")
     proc = subprocess.Popen(
-        cmd, cwd=repo, env=_base_env(objective, branch, database_url),
+        cmd, cwd=repo, env=env,
         stdout=logf, stderr=subprocess.STDOUT, stdin=DEVNULL, start_new_session=True,
     )
     return {"kind": "local", "proc": proc}, logf
 
 
-def launch_container(image, repo, objective, branch, database_url, model, net, log_path):
+def launch_container(image, repo, objective, branch, database_url, model, effort, env_extra, net, log_path):
     name = f"ns-run-{int(time.time())}"
     home = str(Path.home())
     args = ["run", "--rm", "--name", name,
@@ -195,6 +197,10 @@ def launch_container(image, repo, objective, branch, database_url, model, net, l
             "-e", f"NIGHT_SHIFT_BRANCH={branch}"]
     if model:
         args += ["-e", f"NIGHT_SHIFT_MODEL={model}"]
+    if effort:
+        args += ["-e", f"NIGHT_SHIFT_EFFORT={effort}"]
+    for k, v in env_extra.items():  # per-run Codex model/effort config
+        args += ["-e", f"{k}={v}"]
     if net:
         args += ["--network", net]
     if database_url:
@@ -310,8 +316,14 @@ def main():
     ap.add_argument("--repo", help="project repo path (overrides manifest)")
     ap.add_argument("--objective", required=True, help="the shift objective, verbatim")
     ap.add_argument("--branch", default="ns/staging")
-    ap.add_argument("--model", default="claude-opus-4-8",
-                    help="model for the shift (empty string = account default)")
+    ap.add_argument("--config", default=None,
+                    help="JSON run-config: model/effort for Claude + the Codex gates "
+                         "(claude_model, claude_effort, codex_plan_model, codex_plan_effort, "
+                         "codex_review_model, codex_review_effort). CLI flags override it.")
+    ap.add_argument("--model", default=None,
+                    help="Claude model for the shift (overrides --config; default claude-opus-4-8)")
+    ap.add_argument("--effort", default=None,
+                    help="Claude reasoning effort (container only; overrides --config; unset = image default)")
     ap.add_argument("--ntfy-topic", help="ntfy topic (overrides manifest)")
     ap.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
     ap.add_argument("--stall-min", type=int, default=20, help="alert if no progress for N min")
@@ -332,6 +344,27 @@ def main():
         sys.exit("need --repo or --manifest with repo:")
     repo = str(Path(repo).resolve())
     project = Path(repo).name
+
+    # Resolve model/effort from the JSON run-config, with CLI flags overriding.
+    # Nothing is baked in the image: the Codex gate models travel as NS_CODEX_*
+    # env into the run (entrypoint forwards them; SKILL.md + commit_gate.sh read
+    # them, falling back to their own defaults when unset).
+    run_cfg = {}
+    if args.config:
+        with open(args.config) as f:
+            run_cfg = json.load(f)
+    model = args.model or run_cfg.get("claude_model") or "claude-opus-4-8"
+    effort = args.effort or run_cfg.get("claude_effort")
+    env_extra = {}
+    for cfg_key, env_key in (
+        ("codex_plan_model",    "NS_CODEX_PLAN_MODEL"),
+        ("codex_plan_effort",   "NS_CODEX_PLAN_EFFORT"),
+        ("codex_review_model",  "NS_CODEX_REVIEW_MODEL"),
+        ("codex_review_effort", "NS_CODEX_REVIEW_EFFORT"),
+    ):
+        v = run_cfg.get(cfg_key)
+        if v:
+            env_extra[env_key] = str(v)
 
     if not (Path(repo) / ".night-shift" / "scope.yaml").exists():
         sys.exit(f"{repo} is not onboarded (no root-owned .night-shift/scope.yaml)")
@@ -355,16 +388,20 @@ def main():
     where = f"container {args.container}" if args.container else "locally"
     log(f"launching supervised run {where} in {repo}")
     log(f"  objective: {args.objective}")
-    log(f"  branch: {args.branch} | model: {args.model or '(account default)'} "
+    log(f"  branch: {args.branch} | model: {model or '(account default)'} "
+        f"| effort: {effort or '(image default)'} "
         f"| ntfy: {topic or '(none)'} | log: {log_path}")
+    if env_extra:
+        log("  codex: " + " ".join(f"{k.replace('NS_CODEX_', '').lower()}={v}"
+                                   for k, v in env_extra.items()))
     ntfy(topic, "night-shift: started", f"{project}: {args.objective[:120]}", tags="new_moon")
 
     if args.container:
         handle, logf = launch_container(args.container, repo, args.objective, args.branch,
-                                        database_url, args.model, args.net, log_path)
+                                        database_url, model, effort, env_extra, args.net, log_path)
     else:
         handle, logf = launch_local(repo, args.objective, args.branch, database_url,
-                                    args.model, log_path)
+                                    model, env_extra, log_path)
 
     try:
         outcome = monitor(repo, handle, topic, args.stall_min, args.kill_mult,

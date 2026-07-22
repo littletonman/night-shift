@@ -1,0 +1,8 @@
+{
+  "claude_model": "claude-fable-5",
+  "claude_effort": "xhigh",
+  "codex_plan_model": "gpt-5.6-sol",
+  "codex_plan_effort": "xhigh",
+  "codex_review_model": "gpt-5.6-terra",
+  "codex_review_effort": "high"
+}

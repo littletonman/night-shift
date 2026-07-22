@@ -1,0 +1,9 @@
+{
+  "_comment": "Per-run model/effort config passed to supervisor.py via --config. Nothing here is baked into the image: claude_* travel as NIGHT_SHIFT_* env, codex_* as NS_CODEX_* env. Any key may be omitted; the run then uses the built-in default. Individual CLI flags (--model, --effort) override this file.",
+  "claude_model": "claude-opus-4-8",
+  "claude_effort": "high",
+  "codex_plan_model": "gpt-5.6-sol",
+  "codex_plan_effort": "xhigh",
+  "codex_review_model": "gpt-5.6-terra",
+  "codex_review_effort": "high"
+}

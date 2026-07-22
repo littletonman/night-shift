@@ -143,8 +143,12 @@ ns_run_commit_gate() {
   # (Repo-level .codex/config.toml is NOT an effective vector: `codex review`
   # ignores its developer_instructions and even flags such a file as [P2].)
   ns_require_tool codex
-  local codex_effort codex_timeout out rc attempt backoff
-  codex_effort="$(ns_scope_get "$scope" gate.codex_effort high)"
+  local codex_model codex_effort codex_timeout out rc attempt backoff
+  # Model/effort resolve env (operator's per-run config) -> scope.yaml (per-project
+  # pin) -> baked default. The run-config env wins so a model change needs no
+  # rebuild; the agent can't set its own launch env, so this stays tamper-proof.
+  codex_model="${NS_CODEX_REVIEW_MODEL:-$(ns_scope_get "$scope" gate.codex_model gpt-5.6-terra)}"
+  codex_effort="${NS_CODEX_REVIEW_EFFORT:-$(ns_scope_get "$scope" gate.codex_effort high)}"
   codex_timeout="$(ns_scope_get "$scope" gate.codex_timeout_sec 540)"
   backoff="${NS_CAPACITY_BACKOFF_SEC:-10}"
   out="$(mktemp 2>/dev/null || echo /tmp/ns-codex.$$)"
@@ -156,6 +160,7 @@ ns_run_commit_gate() {
     : > "$out"
     ( cd "$root" && timeout "${codex_timeout}s" \
         codex review --uncommitted \
+          -c "model=\"$codex_model\"" \
           -c "model_reasoning_effort=\"$codex_effort\"" \
           -c 'sandbox_mode="read-only"' \
           -c 'project_doc_max_bytes=0' ) >"$out" 2>&1
